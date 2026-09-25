@@ -43,6 +43,24 @@ smtg_create_public_sdk_common_target()
 smtg_create_public_sdk_target()
 
 find_package(Threads REQUIRED)
+find_package(X11 REQUIRED)
+find_package(OpenGL REQUIRED)
+
+set(IGRAPHICS_DIR "${IPLUG2_ROOT}/IGraphics")
+set(IGRAPHICS_DEPS_DIR "${IPLUG2_ROOT}/Dependencies/IGraphics")
+
+# iPlug2's upstream fork (DLC86/iPlug2) doesn't yet have Linux GUI support, and we
+# don't have push access to patch it there. iplug2-linux-overrides/ holds locally
+# patched copies of the handful of iPlug2 core files needed to enable the NanoVG/X11
+# Linux editor (based on iPlug2/iPlug2#1336). Rather than shadowing them via a second
+# include path (which breaks: unmodified iPlug2 headers that live alongside them
+# quote-include their same-directory sibling, which C/C++ resolves before any -I
+# search path, so they'd still pull in the unmodified original and redefine
+# everything), copy them directly over the submodule's checkout at configure time.
+# This never touches the submodule's git state, only its on-disk working tree.
+set(OVERRIDES_DIR "${CMAKE_CURRENT_LIST_DIR}/iplug2-linux-overrides")
+file(COPY "${OVERRIDES_DIR}/IGraphics/" DESTINATION "${IGRAPHICS_DIR}")
+file(COPY "${OVERRIDES_DIR}/IPlug/" DESTINATION "${IPLUG2_ROOT}/IPlug")
 
 file(GLOB NAM_CORE_SOURCES
   "${NAM_CORE_ROOT}/NAM/*.cpp"
@@ -73,6 +91,17 @@ set(PLUGIN_SOURCES
   "${AUDIO_DSP_TOOLS_ROOT}/dsp/RecursiveLinearFilter.cpp"
   "${AUDIO_DSP_TOOLS_ROOT}/dsp/wav.cpp"
   ${NAM_CORE_SOURCES}
+  # IGraphics core + NanoVG/GL2 drawing backend + X11 platform layer
+  "${IGRAPHICS_DIR}/IControl.cpp"
+  "${IGRAPHICS_DIR}/IGraphics.cpp"
+  "${IGRAPHICS_DIR}/IGraphicsEditorDelegate.cpp"
+  "${IGRAPHICS_DIR}/Controls/IControls.cpp"
+  "${IGRAPHICS_DIR}/Controls/IPopupMenuControl.cpp"
+  "${IGRAPHICS_DIR}/Controls/ITextEntryControl.cpp"
+  # IGraphicsLinux.cpp unity-builds IGraphicsNanoVG.cpp itself; don't compile it separately.
+  "${IGRAPHICS_DIR}/Platforms/IGraphicsLinux.cpp"
+  "${IGRAPHICS_DEPS_DIR}/NanoVG/src/nanovg.c"
+  "${IGRAPHICS_DEPS_DIR}/glad_GL2/src/glad.c"
 )
 
 smtg_add_vst3plugin(NAMOnSteroids PACKAGE_NAME "NAM On Steroids" SOURCES_LIST ${PLUGIN_SOURCES})
@@ -80,8 +109,8 @@ smtg_add_vst3plugin(NAMOnSteroids PACKAGE_NAME "NAM On Steroids" SOURCES_LIST ${
 target_compile_definitions(NAMOnSteroids
   PRIVATE
     VST3_API
-    NO_IGRAPHICS
-    NAM_HEADLESS_LINUX
+    IGRAPHICS_NANOVG
+    IGRAPHICS_GL2
     NAM_ENABLE_A2_FAST
 )
 
@@ -93,6 +122,17 @@ target_include_directories(NAMOnSteroids
     "${IPLUG2_ROOT}/IPlug/Extras"
     "${IPLUG2_ROOT}/IPlug/VST3"
     "${IPLUG2_ROOT}/WDL"
+    "${IGRAPHICS_DIR}"
+    "${IGRAPHICS_DIR}/Controls"
+    "${IGRAPHICS_DIR}/Drawing"
+    "${IGRAPHICS_DIR}/Platforms"
+    "${IGRAPHICS_DIR}/Extras"
+    "${IGRAPHICS_DEPS_DIR}/STB"
+    "${IGRAPHICS_DEPS_DIR}/NanoVG/src"
+    "${IGRAPHICS_DEPS_DIR}/NanoSVG/src"
+    "${IGRAPHICS_DEPS_DIR}/glad_GL2/include"
+    "${IGRAPHICS_DEPS_DIR}/glad_GL2/src"
+    "${X11_INCLUDE_DIR}"
     "${VST3_SDK_ROOT}"
     "${VST3_SDK_ROOT}/base/source"
     "${VST3_SDK_ROOT}/pluginterfaces"
@@ -106,7 +146,7 @@ target_include_directories(NAMOnSteroids
     "${AUDIO_DSP_TOOLS_ROOT}/Dependencies/eigen"
 )
 
-target_link_libraries(NAMOnSteroids PRIVATE sdk Threads::Threads)
+target_link_libraries(NAMOnSteroids PRIVATE sdk Threads::Threads ${X11_LIBRARIES} OpenGL::GL ${CMAKE_DL_LIBS})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.0")
     target_link_libraries(NAMOnSteroids PRIVATE stdc++fs)
@@ -123,7 +163,7 @@ target_compile_options(NAMOnSteroids
     -Wno-unused-parameter
     -Wno-missing-field-initializers
     -Wno-deprecated-declarations
-    -include cstdlib
+    $<$<COMPILE_LANGUAGE:CXX>:-include;cstdlib>
     $<$<CONFIG:Release>:-O3>
 )
 
@@ -132,4 +172,17 @@ set_target_properties(NAMOnSteroids
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+)
+
+# Copy GUI resources (images, fonts, third-party notices) flat into the VST3
+# bundle's Contents/Resources, matching the macOS layout so the shared
+# LocateResource() <so_dir>/../Resources/<filename> fallback finds them.
+set(NAM_BUNDLE_RESOURCES_DIR "$<TARGET_FILE_DIR:NAMOnSteroids>/../Resources")
+
+add_custom_command(TARGET NAMOnSteroids POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${NAM_BUNDLE_RESOURCES_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${PLUGIN_ROOT}/resources/img" "${NAM_BUNDLE_RESOURCES_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${PLUGIN_ROOT}/resources/fonts" "${NAM_BUNDLE_RESOURCES_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PLUGIN_ROOT}/installer/ThirdPartyNotices.txt" "${NAM_BUNDLE_RESOURCES_DIR}/ThirdPartyNotices.txt"
+  COMMENT "Copying GUI resources into VST3 bundle"
 )
