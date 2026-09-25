@@ -524,24 +524,31 @@ void IGraphicsNanoVG::EndFrame()
   nvgEndFrame(mVG); // end main frame buffer update
   nvgBindFramebuffer(nullptr);
   nvgBeginFrame(mVG, WindowWidth(), WindowHeight(), GetScreenScale());
-  
-  NVGpaint img = nvgImagePattern(mVG, 0, 0, WindowWidth(), WindowHeight(), 0, mMainFrameBuffer->image, 1.0f);
 
-  nvgSave(mVG);
-  nvgResetTransform(mVG);
-  nvgTranslate(mVG, mXTranslation, mYTranslation);
-  nvgBeginPath(mVG);
-  nvgRect(mVG, 0, 0, WindowWidth(), WindowHeight());
-  nvgFillPaint(mVG, img);
-  nvgFill(mVG);
-  nvgRestore(mVG);
-  
+  // mMainFrameBuffer can be null if DrawResize() failed to (re)create the FBO
+  // (e.g. glGenTextures returning an invalid handle on some GL drivers/setups).
+  // Skip blitting it rather than dereferencing a null pointer; the next
+  // successful resize will recreate it.
+  if (mMainFrameBuffer)
+  {
+    NVGpaint img = nvgImagePattern(mVG, 0, 0, WindowWidth(), WindowHeight(), 0, mMainFrameBuffer->image, 1.0f);
+
+    nvgSave(mVG);
+    nvgResetTransform(mVG);
+    nvgTranslate(mVG, mXTranslation, mYTranslation);
+    nvgBeginPath(mVG);
+    nvgRect(mVG, 0, 0, WindowWidth(), WindowHeight());
+    nvgFillPaint(mVG, img);
+    nvgFill(mVG);
+    nvgRestore(mVG);
+  }
+
 #if defined OS_MAC && defined IGRAPHICS_GL
   glBindFramebuffer(GL_FRAMEBUFFER, mInitialFBO); // restore apple fbo
 #endif
 
   nvgEndFrame(mVG);
-  
+
   mInDraw = false;
   ClearFBOStack();
 }
