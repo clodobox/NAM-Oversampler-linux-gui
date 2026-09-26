@@ -254,6 +254,7 @@ void IPopupMenuControl::OnMouseWheel(float x, float y, const IMouseMod& mod, flo
   // window — a folder with more files than fit, the 33-entry CC submenus, ...
   // could only be scrolled with the small arrow cells at its ends. Scroll it
   // with the wheel instead when the panel is a scroller.
+
   if (mActiveMenuPanel == nullptr || !mActiveMenuPanel->mScroller)
     return;
 
@@ -450,6 +451,7 @@ void IPopupMenuControl::DrawSeparator(IGraphics& g, const IRECT& bounds, IBlend*
 
 void IPopupMenuControl::CreatePopupMenu(IPopupMenu& menu, const IRECT& bounds)
 {
+
   mMenu = &menu;
   
   for (int i = 0; i< mMenu->NItems(); i++)
@@ -827,6 +829,7 @@ void IPopupMenuControl::Expand(const IRECT& anchorArea)
   
   mActiveMenuPanel = mAppearingMenuPanel = mMenuPanels.Add(new MenuPanel(*this, *mMenu, x, y, -1));
 
+
   SetTargetRECT(mActiveMenuPanel->mTargetRECT);
   SetRECT(mActiveMenuPanel->mRECT);
 
@@ -928,10 +931,33 @@ IPopupMenuControl::MenuPanel::MenuPanel(IPopupMenuControl& control, IPopupMenu& 
 , mParentIdx(parentIdx)
 {
   mSingleCellBounds = control.GetLargestCellRectForMenu(menu, x, y);
-  
+
   float left = x + control.PAD;
   float top = y + control.PAD;
+
   
+  // Decide up front whether the whole menu can fit, and switch to the scroller
+  // if it cannot.
+  //
+  // The in-loop test further down compares `top` against mMaxBounds.B, but
+  // Expand() has already moved the panel up so that it *ends* inside the
+  // window, which means `top` starts negative and never reaches the bottom
+  // while items are added - so that test can never fire and the panel is built
+  // with one cell per item. A 180-entry folder menu was therefore 180 rows tall,
+  // anchored far above the window: only its last rows were visible and the rest
+  // could neither be seen nor clicked.
+  if (control.mScrollIfTooBig)
+  {
+    const float maxTop = control.mMaxBounds.T + control.PAD + control.mDropShadowSize;
+    const float maxBottom = control.mMaxBounds.B - control.PAD;
+    const float maxH = maxBottom - maxTop;
+
+    mScrollMaxRows = static_cast<int>(maxH / (CellHeight() + control.mCellGap));
+
+    if (mScrollMaxRows > 0 && menu.NItems() > mScrollMaxRows)
+      mScroller = true;
+  }
+
   // cell height can change depending on if cell is a separator or not
   auto GetIncrements = [&](IPopupMenu::Item* pMenuItem, float& incX, float& incY)
   {
@@ -943,7 +969,22 @@ IPopupMenuControl::MenuPanel::MenuPanel(IPopupMenuControl& control, IPopupMenu& 
       incY = CellHeight();
   };
   
-  for (auto i = 0; i < menu.NItems(); ++i)
+  if (mScroller)
+  {
+    float toAddX = 0.f, toAddY = 0.f;
+    top = control.mMaxBounds.T + control.PAD + control.mDropShadowSize;
+
+    for (auto r = 0; r < mScrollMaxRows; r++)
+    {
+      GetIncrements(menu.GetItem(r), toAddX, toAddY);
+      const float right = left + toAddX;
+      const float bottom = top + toAddY;
+      mCellBounds.Add(new IRECT(left, top, right, bottom));
+      top = bottom + control.mCellGap;
+    }
+  }
+
+  for (auto i = 0; i < menu.NItems() && !mScroller; ++i)
   {
     IPopupMenu::Item* pMenuItem = menu.GetItem(i);
     float right, bottom;
