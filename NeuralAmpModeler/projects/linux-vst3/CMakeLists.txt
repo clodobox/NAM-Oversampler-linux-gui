@@ -12,6 +12,12 @@ string(REGEX REPLACE "^#define PLUG_VERSION_STR \"([0-9]+\\.[0-9]+\\.[0-9]+)\".*
 
 project(NAMOnSteroids-Linux VERSION ${PLUG_VERSION})
 
+# Link-time optimisation. On by default; the ARM builds turn it off because they
+# are produced with an emulated (qemu-user) Debian toolchain, where LTO's
+# lto-wrapper has to spawn the compiler through a shell and cannot run the
+# target's binaries directly.
+option(NAM_ENABLE_LTO "Enable link-time optimisation in Release builds" ON)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -171,7 +177,7 @@ set_target_properties(NAMOnSteroids
   PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
-    INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+    INTERPROCEDURAL_OPTIMIZATION_RELEASE ${NAM_ENABLE_LTO}
 )
 
 # Copy GUI resources (images, fonts, third-party notices) flat into the VST3
