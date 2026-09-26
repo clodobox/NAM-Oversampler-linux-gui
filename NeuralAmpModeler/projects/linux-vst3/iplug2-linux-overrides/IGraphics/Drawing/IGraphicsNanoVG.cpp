@@ -114,9 +114,22 @@ IGraphicsNanoVG::Bitmap::Bitmap(IGraphicsNanoVG* pGraphics, NVGcontext* pContext
   mGraphics = pGraphics;
   mVG = pContext;
   mFBO = nvgCreateFramebuffer(pContext, width, height, 0);
-  
+
+  // nvgluCreateFramebuffer() returns NULL when glCheckFramebufferStatus() is not
+  // GL_FRAMEBUFFER_COMPLETE (bad/incomplete GL setup). Release builds have
+  // assert() compiled out, so the old code dereferenced mFBO->image and crashed
+  // on every layer / shadow mask / SVG control. Fall back to an empty bitmap:
+  // the caller gets a valid object it can draw into the (nonexistent) bitmap of,
+  // which NanoVG renders as nothing.
+  if (mFBO == nullptr)
+  {
+    DBGMSG("IGraphicsNanoVG: could not create framebuffer, using empty bitmap\n");
+    SetBitmap(0, width > 0 ? width : 1, height > 0 ? height : 1, scale, drawScale);
+    return;
+  }
+
   nvgBindFramebuffer(mFBO);
-  
+
 #ifdef IGRAPHICS_METAL
   mnvgClearWithColor(mVG, nvgRGBAf(0, 0, 0, 0));
 #else
@@ -126,7 +139,7 @@ IGraphicsNanoVG::Bitmap::Bitmap(IGraphicsNanoVG* pGraphics, NVGcontext* pContext
 #endif
   nvgBeginFrame(mVG, width, height, 1.f);
   nvgEndFrame(mVG);
-  
+
   SetBitmap(mFBO->image, width, height, scale, drawScale);
 }
 
@@ -475,27 +488,40 @@ void IGraphicsNanoVG::OnViewDestroyed()
 
   StaticStorage<APIBitmap>::Accessor storage(mBitmapCache);
   storage.Clear();
-  
+
+  // Drain the deferred-deletion stack BEFORE nvgDeleteContext(). DeleteFBO()
+  // pushes framebuffers onto mFBOStack while a frame is in progress, and
+  // nvgluDeleteFramebuffer() calls nvgDeleteImage(fb->ctx, ...) — the NanoVG
+  // context captured when the framebuffer was created. Any entry still on the
+  // stack after nvgDeleteContext() would use a freed context.
+  mInDraw = false;
+  ClearFBOStack();
+
   if(mMainFrameBuffer != nullptr)
     nvgDeleteFramebuffer(mMainFrameBuffer);
-  
+
   mMainFrameBuffer = nullptr;
-  
+
   if(mVG)
     nvgDeleteContext(mVG);
-  
+
   mVG = nullptr;
 }
 
 void IGraphicsNanoVG::DrawResize()
 {
   if (mMainFrameBuffer != nullptr)
+  {
     nvgDeleteFramebuffer(mMainFrameBuffer);
-  
+    // Must be cleared unconditionally: if mVG is null below, the stale pointer
+    // would be deleted again (or blitted) by BeginFrame/EndFrame.
+    mMainFrameBuffer = nullptr;
+  }
+
   if (mVG)
   {
     mMainFrameBuffer = nvgCreateFramebuffer(mVG, WindowWidth() * GetScreenScale(), WindowHeight() * GetScreenScale(), 0);
-  
+
     if (mMainFrameBuffer == nullptr)
       DBGMSG("Could not init FBO.\n");
   }
@@ -508,7 +534,11 @@ void IGraphicsNanoVG::BeginFrame()
 
 #ifdef IGRAPHICS_GL
     glViewport(0, 0, WindowWidth() * GetScreenScale(), WindowHeight() * GetScreenScale());
-    glClearColor(0.f, 0.f, 0.f, 0.f);
+    // Opaque black, not transparent: when the UI is scaled to fit a window whose
+    // aspect ratio does not match, the area the UI does not cover is part of the
+    // window. Clearing to alpha 0 leaves that area showing whatever was in the
+    // swap chain, which is the "glitch" seen while resizing.
+    glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   #if defined OS_MAC
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mInitialFBO); // stash apple fbo
@@ -556,9 +586,15 @@ void IGraphicsNanoVG::EndFrame()
 void IGraphicsNanoVG::DrawBitmap(const IBitmap& bitmap, const IRECT& dest, int srcX, int srcY, const IBlend* pBlend)
 {
   APIBitmap* pAPIBitmap = bitmap.GetAPIBitmap();
-  
+
   assert(pAPIBitmap);
-    
+
+  // LoadBitmap() returns an invalid IBitmap when a resource cannot be located
+  // (missing/renamed file in the bundle), and assert() is compiled out of
+  // release builds — the deref below would then fault.
+  if (pAPIBitmap == nullptr)
+    return;
+
   // First generate a scaled image paint
   NVGpaint imgPaint;
   double scale = 1.0 / (pAPIBitmap->GetScale() * pAPIBitmap->GetDrawScale());
@@ -631,8 +667,11 @@ IColor IGraphicsNanoVG::GetPoint(int x, int y)
 
 void IGraphicsNanoVG::PrepareAndMeasureText(const IText& text, const char* str, IRECT& r, double& x, double & y) const
 {
-  float fbounds[4];
-  
+  // Zero-initialised: with the fontstash-based NanoVG this vendored copy uses,
+  // nvgTextBounds() returns early without writing the bounds when the font is
+  // not registered, which would leave garbage in r.
+  float fbounds[4] = {};
+
   assert(nvgFindFont(mVG, text.mFont) != -1 && "No font found - did you forget to load it?");
   
   nvgFontBlur(mVG, 0);
@@ -793,7 +832,11 @@ void IGraphicsNanoVG::UpdateLayer()
     const double scale = GetBackingPixelScale();
     glViewport(0, 0, mLayers.top()->Bounds().W() * scale, mLayers.top()->Bounds().H() * scale);
 #endif
-    nvgBindFramebuffer(dynamic_cast<const Bitmap*>(mLayers.top()->GetAPIBitmap())->GetFBO());
+    // A layer can be backed by a plain image bitmap rather than a NanoVG layer
+    // Bitmap, in which case the cast yields null; fall back to the default
+    // framebuffer instead of dereferencing it.
+    const Bitmap* pLayerBitmap = dynamic_cast<const Bitmap*>(mLayers.top()->GetAPIBitmap());
+    nvgBindFramebuffer(pLayerBitmap ? pLayerBitmap->GetFBO() : nullptr);
     nvgBeginFrame(mVG, mLayers.top()->Bounds().W() * GetDrawScale(), mLayers.top()->Bounds().H() * GetDrawScale(), GetScreenScale());
   }
 }

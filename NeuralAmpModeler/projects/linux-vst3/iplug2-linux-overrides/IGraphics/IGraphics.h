@@ -1285,6 +1285,19 @@ public:
    * @param sizeMode Choose whether to scale or size the UI */
   void AttachCornerResizer(EUIResizerMode sizeMode = EUIResizerMode::Scale, bool layoutOnResize = false, const IColor& color = COLOR_TRANSLUCENT, const IColor& mouseOverColor = COLOR_BLACK, const IColor& dragColor = COLOR_BLACK, float size = 20.f);
 
+  /** \c true while the built-in (self-drawn) popup menu is open.
+   *
+   * Platform layers that draw the popup menu themselves rather than using a
+   * native one need this: a native menu owns a window of its own and captures
+   * the pointer, so a click anywhere — including outside the plug-in's window —
+   * dismisses it. A self-drawn menu has no such window, so on X11 the platform
+   * layer grabs the pointer for as long as this returns \c true, otherwise a
+   * click outside the plug-in window never reaches the menu and the user is
+   * stuck in it until they choose an item.
+   *
+   * Defined in IGraphics.cpp because IPopupMenuControl is only complete there. */
+  bool IsPopupMenuExpanded() const;
+
   /** Attach your own control to scale or increase the UI size by dragging the plug-in bottom right-hand corner
    * @param pControl control a control that inherits from ICornerResizerControl
    * @param sizeMode Choose whether to scale or size the UI */

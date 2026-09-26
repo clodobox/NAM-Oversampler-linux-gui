@@ -11,11 +11,23 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <spawn.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <array>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <sstream>
+#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <dlfcn.h>
+
+extern char** environ;
 // Fontconfig is loaded via dlopen so the plugin works without it installed.
 // Only the font-by-name lookup (LoadPlatformFont) needs it; embedded fonts work regardless.
 
@@ -444,6 +456,8 @@ IGraphicsLinux::IGraphicsLinux(IGEditorDelegate& dlg, int w, int h, int fps, flo
   // Required before any Xlib calls from multiple threads
   XInitThreads();
 
+  // NOTE: AttachPopupMenuControl() must NOT be called here.
+  //
   // Popup menus (CreatePlatformPopupMenu below) are built with GTK3 and run
   // GTK's own nested main loop (g->main()/g->main_quit()) to wait for the
   // user's choice. That call happens on our internal render/timer thread
@@ -457,7 +471,16 @@ IGraphicsLinux::IGraphicsLinux(IGEditorDelegate& dlg, int w, int h, int fps, flo
   // whenever CreatePlatformPopupMenu isn't available) instead, which reuses
   // our existing NanoVG rendering and X11 event pump rather than a second,
   // independent toolkit's own loop.
-  AttachPopupMenuControl();
+  //
+  // It is attached in OpenWindow() instead, because IControl::SetDelegate()
+  // caches `dlg.GetUI()` into the control's mGraphics — and when this
+  // constructor runs, the delegate's mGraphics unique_ptr has not been
+  // assigned yet (IGEditorDelegate::OpenWindow does
+  // `mGraphics = std::unique_ptr<IGraphics>(CreateGraphics())`, and
+  // CreateGraphics() is what is running this constructor). Attaching here
+  // therefore left mPopupControl with a permanently null mGraphics, and the
+  // first popup menu opened dereferenced it in
+  // IPopupMenuControl::CreatePopupMenu() -> GetUI()->GetBounds().
 }
 
 IGraphicsLinux::~IGraphicsLinux()
@@ -465,28 +488,108 @@ IGraphicsLinux::~IGraphicsLinux()
   CloseWindow();
 }
 
-static int sIgnoreX11Error(Display*, XErrorEvent*) { return 0; }
+// Process-wide Xlib error handling.
+//
+// Xlib's default error handler prints the error and calls exit(1). Inside a
+// plugin that is fatal for the whole host process: any failing X request — a
+// resize to 0x0, a request on a window the host just destroyed, a clipboard
+// reply to a client that already exited, glXSwapBuffers on a dead drawable —
+// takes the DAW down with it, which is exactly the "it crashes and the host
+// disappears" behaviour we need to avoid. Install one never-exiting handler for
+// the lifetime of the process, and chain to whatever handler was installed
+// before for errors raised on displays that are not ours, so a host relying on
+// its own X error handler keeps working.
+namespace
+{
+constexpr int kMaxXDisplays = 16;
+std::array<std::atomic<Display*>, kMaxXDisplays> sOurXDisplays{};
+XErrorHandler sPrevXErrorHandler = nullptr;
+
+void RegisterXDisplay(Display* d)
+{
+  for (auto& slot : sOurXDisplays)
+  {
+    Display* expected = nullptr;
+    if (slot.compare_exchange_strong(expected, d) || expected == d)
+      break;
+  }
+}
+
+void UnregisterXDisplay(Display* d)
+{
+  for (auto& slot : sOurXDisplays)
+  {
+    Display* expected = d;
+    if (slot.compare_exchange_strong(expected, nullptr))
+      return;
+  }
+}
+
+bool IsOurXDisplay(Display* d)
+{
+  for (auto& slot : sOurXDisplays)
+    if (slot.load(std::memory_order_relaxed) == d)
+      return true;
+  return false;
+}
+
+// Never allocate, throw or take our own locks from here: this runs on whichever
+// thread made the failing request, possibly while it holds GfxMutex.
+int XErrorHandlerProc(Display* d, XErrorEvent* e)
+{
+  if (!IsOurXDisplay(d))
+    return sPrevXErrorHandler ? sPrevXErrorHandler(d, e) : 0;
+
+  char msg[256] = {};
+  XGetErrorText(d, e->error_code, msg, sizeof(msg) - 1);
+  fprintf(stderr, "IGraphicsLinux: ignoring X error '%s' (request %d.%d, resource 0x%lx)\n",
+          msg, (int)e->request_code, (int)e->minor_code, (unsigned long)e->resourceid);
+  return 0;
+}
+
+void InstallXErrorHandlerOnce()
+{
+  static std::once_flag once;
+  std::call_once(once, [] { sPrevXErrorHandler = XSetErrorHandler(XErrorHandlerProc); });
+}
+}  // namespace
 
 void* IGraphicsLinux::OpenWindow(void* pParent)
 {
+  // Opening twice would leak the previous Display, X11 window, colormap and GLX
+  // context; IGraphicsMac and IGraphicsWin both close first.
+  if (mDisplay)
+    CloseWindow();
+
   mDisplay = XOpenDisplay(nullptr);
   if (!mDisplay)
     return nullptr;
+
+  InstallXErrorHandlerOnce();
+  RegisterXDisplay(mDisplay);
+  mWindowAlive = true;
+  mCloseRequested = false;
+
+  // Attach the self-drawn popup menu control now that the delegate's mGraphics
+  // is live (see the note in the constructor). Re-create it on every open:
+  // IControl::SetDelegate() caches the IGraphics pointer, so a control attached
+  // during a previous open would be left pointing at a stale instance.
+  RemovePopupMenuControl();
+  AttachPopupMenuControl();
 
   int screen = DefaultScreen(mDisplay);
   Window root = RootWindow(mDisplay, screen);
 
   // Validate pParent is an actual X11 Window, not a SWELL generic HWND pointer.
   // In standalone mode the APP host passes gHWND, which is a heap pointer —
-  // XGetWindowAttributes will fail for it and we fall back to root.
+  // XGetWindowAttributes fails for it (the error is swallowed by the handler
+  // installed above) and we fall back to root.
   mParentWnd = root;
   if (pParent)
   {
-    XErrorHandler prev = XSetErrorHandler(sIgnoreX11Error);
     XWindowAttributes wa = {};
     int ok = XGetWindowAttributes(mDisplay, (Window)(uintptr_t)pParent, &wa);
     XSync(mDisplay, 0 /* discard=False */);
-    XSetErrorHandler(prev);
     if (ok)
       mParentWnd = (Window)(uintptr_t)pParent;
   }
@@ -622,19 +725,48 @@ void* IGraphicsLinux::OpenWindow(void* pParent)
     DestroyGLContext();
     if (mGLColormap) { XFreeColormap(mDisplay, mGLColormap); mGLColormap = 0; }
     XDestroyWindow(mDisplay, mPlugWnd); mPlugWnd = 0;
+    UnregisterXDisplay(mDisplay);
     XCloseDisplay(mDisplay); mDisplay = nullptr;
     return nullptr;
   }
-  gladLoadGL();
+  mGLContextDepth = 1;  // context is now current on this thread
+  if (!gladLoadGL())
+  {
+    // Every GL entry point below would be a null function pointer.
+    DBGMSG("IGraphicsLinux: gladLoadGL failed\n");
+    DeactivateGLContext();
+    DestroyGLContext();
+    if (mGLColormap) { XFreeColormap(mDisplay, mGLColormap); mGLColormap = 0; }
+    XDestroyWindow(mDisplay, mPlugWnd); mPlugWnd = 0;
+    UnregisterXDisplay(mDisplay);
+    XCloseDisplay(mDisplay); mDisplay = nullptr;
+    return nullptr;
+  }
   // Keep GL context current through OnViewInitialized, LayoutUI, and DrawResize —
   // NanoVG context creation, font loading, and FBO initialisation all need active GL.
   OnViewInitialized(nullptr);
+  if (!GetDrawContext())
+  {
+    // nvgCreateContext() failed (no GL 2.0, missing extension, ...). Every
+    // drawing call — including the one in the timer thread a moment from now —
+    // would dereference a null NanoVG context, so refuse to open instead of
+    // starting a timer that crashes on its first tick.
+    DBGMSG("IGraphicsLinux: NanoVG context creation failed, not opening\n");
+    CloseWindow();
+    return nullptr;
+  }
   GetDelegate()->LayoutUI(this);
   SetAllControlsDirty();
   DrawResize();
-  glXMakeCurrent(mDisplay, 0, nullptr);
+  DeactivateGLContext();
 #else
   OnViewInitialized(nullptr);
+  if (!GetDrawContext())
+  {
+    DBGMSG("IGraphicsLinux: NanoVG context creation failed, not opening\n");
+    CloseWindow();
+    return nullptr;
+  }
   GetDelegate()->LayoutUI(this);
   SetAllControlsDirty();
   DrawResize();
@@ -655,12 +787,45 @@ void IGraphicsLinux::CloseWindow()
   if (!mDisplay)
     return;
 
+  // Never tear the window down from the timer thread: ProcessX11Events() (a
+  // member of this object) would return into a destroyed mDisplay, and
+  // OnDisplayTimer() would keep drawing on a freed IGraphics. The event pump
+  // only sets mCloseRequested; the owning thread performs the close.
+  if (pthread_equal(pthread_self(), mTimerThread))
+  {
+    mCloseRequested = true;
+    mTimerRunning = false;  // makes the render loop exit after this tick
+    return;
+  }
+
   StopTimer();
+
+  // Any out-of-process dialog still open must not hand its result back to a
+  // window that no longer exists. The helper threads own their slot through a
+  // shared_ptr, so they keep running safely; they just drop the result. (Safe to
+  // touch mDialogSlots here: StopTimer() has joined the render thread.)
+  for (auto& slot : mDialogSlots)
+  {
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    slot->abandoned = true;
+    slot->result.fileHandler = nullptr;
+    slot->result.msgHandler = nullptr;
+  }
+  mDialogSlots.clear();
+
+  // OnViewDestroyed() below deletes the NanoVG context and its GL textures and
+  // framebuffers, and DestroyGLContext() destroys the context itself, so the
+  // context must be current — mPlugWnd is still alive at this point, and
+  // IGraphicsMac does the same (makeCurrentContext before OnViewDestroyed).
+  ActivateGLContext();
   OnViewDestroyed();
+  DeactivateGLContext();
 
 #ifdef IGRAPHICS_GL
   DestroyGLContext();
 #endif
+
+  mWindowAlive = false;
 
   if (mBlankCursor)
   {
@@ -682,8 +847,11 @@ void IGraphicsLinux::CloseWindow()
   }
 #endif
 
+  UnregisterXDisplay(mDisplay);
   XCloseDisplay(mDisplay);
   mDisplay = nullptr;
+  mParentWnd = 0;
+  mGLContextDepth = 0;
 }
 
 void IGraphicsLinux::PlatformResize(bool parentHasResized)
@@ -711,7 +879,15 @@ void IGraphicsLinux::PlatformResize(bool parentHasResized)
 void IGraphicsLinux::DrawResize()
 {
   std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+
+  // DrawResize() recreates the main framebuffer and every cached layer/APIBitmap
+  // (glGenTextures/glGenFramebuffers/glRenderbufferStorage), so the GL context
+  // must be current. This is reachable from the host thread too
+  // (setContentScaleFactor / onSize -> Resize -> DrawResize), where nothing else
+  // has bound the context.
+  ActivateGLContext();
   IGRAPHICS_DRAW_CLASS::DrawResize();
+  DeactivateGLContext();
 }
 
 void IGraphicsLinux::OnBeginHostResize(int physW, int physH)
@@ -830,14 +1006,286 @@ void IGraphicsLinux::GetMouseLocation(float& x, float& y) const
   int rootX, rootY, winX, winY;
   unsigned int mask;
   XQueryPointer(mDisplay, mPlugWnd, &root, &child, &rootX, &rootY, &winX, &winY, &mask);
-  x = (float)winX;
-  y = (float)winY;
+  // X11 reports physical pixels; every other coordinate conversion (mouse
+  // events, MoveMouseCursor) divides by the total scale, so do the same here or
+  // tooltips/popup positioning are offset by the scale factor on HiDPI.
+  const float scale = GetTotalScale();
+  x = (float)winX / scale;
+  y = (float)winY / scale;
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-process dialog helpers (zenity)
+//
+// Running the dialog in a child process keeps GTK out of our address space
+// entirely, so there is no nested GTK main loop on the render thread and
+// nothing to race against a GTK-based host. The helpers here only fork/exec,
+// read a pipe and wait — they never touch IGraphics state.
+// ---------------------------------------------------------------------------
+namespace
+{
+bool HaveZenity()
+{
+  // Resolved once: PATH lookups are cheap but this is called for every dialog
+  // and the answer cannot change while the host runs.
+  static const bool sHave = []
+  {
+    const char* path = getenv("PATH");
+    if (!path)
+      return false;
+    std::string p(path);
+    size_t start = 0;
+    while (start <= p.size())
+    {
+      size_t end = p.find(':', start);
+      if (end == std::string::npos)
+        end = p.size();
+      std::string dir = p.substr(start, end - start);
+      if (!dir.empty())
+      {
+        std::string candidate = dir + "/zenity";
+        if (access(candidate.c_str(), X_OK) == 0)
+          return true;
+      }
+      start = end + 1;
+    }
+    return false;
+  }();
+  return sHave;
+}
+
+struct ZenityResult
+{
+  bool ran = false;   // false => could not start zenity at all
+  int exitCode = -1;  // 0 = accepted, 1 = cancelled
+  std::string out;    // chosen path, newline trimmed
+};
+
+// Runs `zenity <args>` and captures its stdout. Safe to call from any thread.
+ZenityResult RunZenity(const std::vector<std::string>& args)
+{
+  ZenityResult result;
+
+  int pipefd[2] = {-1, -1};
+  if (pipe(pipefd) != 0)
+    return result;
+
+  std::vector<std::string> argv;
+  argv.push_back("zenity");
+  for (const auto& a : args)
+    argv.push_back(a);
+
+  std::vector<char*> cArgv;
+  cArgv.reserve(argv.size() + 1);
+  for (auto& a : argv)
+    cArgv.push_back(const_cast<char*>(a.c_str()));
+  cArgv.push_back(nullptr);
+
+  // posix_spawn rather than fork: this process is multi-threaded and may have
+  // GTK loaded, so a fork()+exec with anything but async-signal-safe calls in
+  // between is not safe.
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+  posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+  // Silence zenity's own diagnostics: they are not ours to print.
+  posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+  pid_t pid = 0;
+  const int spawnErr = posix_spawnp(&pid, "zenity", &fa, nullptr, cArgv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(pipefd[1]);
+
+  if (spawnErr != 0)
+  {
+    close(pipefd[0]);
+    return result;  // not installed / not executable
+  }
+
+  result.ran = true;
+
+  char buf[512];
+  ssize_t n;
+  while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+  {
+    if (result.out.size() < 8192)
+      result.out.append(buf, (size_t)n);
+  }
+  close(pipefd[0]);
+
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
+  result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+  while (!result.out.empty() && (result.out.back() == '\n' || result.out.back() == '\r'))
+    result.out.pop_back();
+
+  return result;
+}
+}  // namespace
+
+void IGraphicsLinux::DrainPendingDialogs()
+{
+  for (auto it = mDialogSlots.begin(); it != mDialogSlots.end();)
+  {
+    auto slot = *it;
+    bool have = false;
+    DialogResult::Kind kind = DialogResult::Kind::File;
+    EMsgBoxResult msgResult = EMsgBoxResult::kOK;
+    IFileDialogCompletionHandlerFunc fileHandler;
+    IMsgBoxCompletionHandlerFunc msgHandler;
+    WDL_String file;
+    WDL_String path;
+
+    {
+      std::lock_guard<std::mutex> lock(slot->mutex);
+      if (slot->hasResult)
+      {
+        // Copy field by field (WDL_String's implicit copy assignment is
+        // deprecated) and clear hasResult, after which the helper thread never
+        // touches this slot again.
+        kind = slot->result.kind;
+        msgResult = slot->result.msgResult;
+        fileHandler = slot->result.fileHandler;
+        msgHandler = slot->result.msgHandler;
+        file.Set(slot->result.file.Get(), slot->result.file.GetLength());
+        path.Set(slot->result.path.Get(), slot->result.path.GetLength());
+        slot->hasResult = false;
+        have = true;
+      }
+    }
+
+    if (have)
+    {
+      switch (kind)
+      {
+        case DialogResult::Kind::File:
+        case DialogResult::Kind::Directory:
+          if (fileHandler)
+            fileHandler(file, path);
+          break;
+        case DialogResult::Kind::MessageBox:
+          if (msgHandler)
+            msgHandler(msgResult);
+          break;
+      }
+      it = mDialogSlots.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+}
+
+void IGraphicsLinux::StartOutOfProcessFileDialog(bool isDirectory, bool isSave,
+                                                 const WDL_String& initialPath,
+                                                 const WDL_String& initialFileName,
+                                                 const char* ext,
+                                                 IFileDialogCompletionHandlerFunc completionHandler)
+{
+  auto slot = std::make_shared<DialogSlot>();
+  slot->result.kind = isDirectory ? DialogResult::Kind::Directory : DialogResult::Kind::File;
+  slot->result.fileHandler = completionHandler;
+  mDialogSlots.push_back(slot);
+
+  std::vector<std::string> args;
+  args.push_back("--file-selection");
+  if (isDirectory)
+    args.push_back("--directory");
+  else if (isSave)
+    args.push_back("--save");
+
+  // Starting location: iPlug passes a directory in `path` and, when saving, a
+  // suggested file name in `fileName`.
+  std::string start;
+  if (initialPath.GetLength())
+    start = initialPath.Get();
+  if (isSave && initialFileName.GetLength())
+    start += initialFileName.Get();
+  if (!start.empty())
+    args.push_back("--filename=" + start);
+
+  if (!isDirectory && ext && ext[0])
+  {
+    // iPlug's `ext` is a space-separated list ("bmp jpg png"); zenity wants a
+    // "Name | glob glob" filter.
+    std::string patterns;
+    std::istringstream ss(ext);
+    std::string token;
+    while (ss >> token)
+    {
+      if (!patterns.empty())
+        patterns += " ";
+      patterns += "*." + token;
+    }
+    if (!patterns.empty())
+    {
+      args.push_back(std::string("--file-filter=") + ext + " | " + patterns);
+      args.push_back("--file-filter=All Files | *");
+    }
+  }
+
+  // Detached: the dialog outlives this call by design. The thread only ever
+  // touches `slot`, which it shares with us, so it cannot dangle if the window
+  // is closed first.
+  std::thread([slot, args]() {
+    const ZenityResult zr = RunZenity(args);
+
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    if (slot->abandoned)
+      return;
+
+    // Always publish a result, including on failure, so the completion handler
+    // runs (with empty strings, which every caller treats as "cancelled")
+    // instead of the control being left waiting forever.
+    if (zr.ran && zr.exitCode == 0 && !zr.out.empty())
+    {
+      slot->result.file.Set(zr.out.c_str());
+      const char* slash = strrchr(zr.out.c_str(), '/');
+      if (slash)
+        slot->result.path.Set(zr.out.c_str(), (int)(slash - zr.out.c_str() + 1));
+    }
+    slot->hasResult = true;
+  }).detach();
 }
 
 EMsgBoxResult IGraphicsLinux::ShowMessageBox(const char* str, const char* title,
                                              EMsgBoxType type,
                                              IMsgBoxCompletionHandlerFunc completionHandler)
 {
+  // Out-of-process first: see the note on DialogResult in the header. This call
+  // is synchronous by contract (callers use the return value), so we block this
+  // thread on the child process instead of entering a nested GTK loop.
+  if (HaveZenity())
+  {
+    std::vector<std::string> args;
+    args.push_back("--title=" + std::string(title ? title : ""));
+    args.push_back("--text=" + std::string(str ? str : ""));
+    switch (type)
+    {
+      case kMB_OKCANCEL:    args.push_back("--question"); args.push_back("--ok-label=OK");     args.push_back("--cancel-label=Cancel"); break;
+      case kMB_YESNO:       args.push_back("--question"); args.push_back("--ok-label=Yes");    args.push_back("--cancel-label=No");     break;
+      case kMB_YESNOCANCEL: args.push_back("--question"); args.push_back("--ok-label=Yes");    args.push_back("--cancel-label=No");     break;
+      default:              args.push_back("--info"); break;
+    }
+
+    const ZenityResult zr = RunZenity(args);
+    if (zr.ran)
+    {
+      EMsgBoxResult result = kOK;
+      if (zr.exitCode != 0)
+        result = (type == kMB_OK) ? kOK : kCANCEL;
+
+      if (completionHandler)
+        completionHandler(result);
+      return result;
+    }
+    // zenity vanished between the PATH check and the spawn: fall through to GTK.
+  }
+
   GTK3* g = LoadGTK3();
   if (!g || !g->message_dialog_new)
   {
@@ -904,6 +1352,16 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
                                    EFileAction action, const char* ext,
                                    IFileDialogCompletionHandlerFunc completionHandler)
 {
+  if (HaveZenity())
+  {
+    // Returns immediately; the handler runs from DrainPendingDialogs() on the
+    // render thread, which is what the IFileDialogCompletionHandlerFunc API is
+    // for. Avoids the nested GTK main loop entirely.
+    StartOutOfProcessFileDialog(false, action == EFileAction::Save, path, fileName, ext,
+                                completionHandler);
+    return;
+  }
+
   GTK3* g = LoadGTK3();
   if (!g)
   {
@@ -972,6 +1430,12 @@ void IGraphicsLinux::PromptForFile(WDL_String& fileName, WDL_String& path,
 void IGraphicsLinux::PromptForDirectory(WDL_String& dir,
                                         IFileDialogCompletionHandlerFunc completionHandler)
 {
+  if (HaveZenity())
+  {
+    StartOutOfProcessFileDialog(true, false, dir, WDL_String{}, nullptr, completionHandler);
+    return;
+  }
+
   GTK3* g = LoadGTK3();
   if (!g)
   {
@@ -1406,16 +1870,40 @@ void IGraphicsLinux::CachePlatformFont(const char* fontID, const PlatformFontPtr
 void IGraphicsLinux::ActivateGLContext()
 {
 #ifdef IGRAPHICS_GL
-  if (!mDisplay || !mGLContext) return;
-  glXMakeCurrent(mDisplay, mPlugWnd, (GLXContext)mGLContext);
+  if (!mDisplay || !mGLContext)
+    return;
+
+  // Nesting: only the outermost Activate actually binds the context, so a
+  // nested Deactivate (e.g. the one at the end of LoadAPIBitmap) cannot unbind
+  // the context the render thread is still drawing with.
+  if (mGLContextDepth++ == 0)
+  {
+    // With an X11 error handler installed the failure mode here is a returned
+    // False, not a crash — surface it rather than silently drawing into
+    // whatever context happens to be current.
+    if (!glXMakeCurrent(mDisplay, mPlugWnd, (GLXContext)mGLContext))
+    {
+      DBGMSG("IGraphicsLinux: glXMakeCurrent failed\n");
+      mGLContextDepth = 0;
+    }
+  }
 #endif
 }
 
 void IGraphicsLinux::DeactivateGLContext()
 {
 #ifdef IGRAPHICS_GL
-  if (!mDisplay) return;
-  glXMakeCurrent(mDisplay, 0, nullptr);
+  if (!mDisplay || !mGLContext)
+    return;
+
+  if (mGLContextDepth <= 0)
+  {
+    mGLContextDepth = 0;
+    return;
+  }
+
+  if (--mGLContextDepth == 0)
+    glXMakeCurrent(mDisplay, 0, nullptr);
 #endif
 }
 
@@ -1455,6 +1943,7 @@ void IGraphicsLinux::DestroyGLContext()
 {
   if (mDisplay && mGLContext)
   {
+    mGLContextDepth = 0;
     glXMakeCurrent(mDisplay, 0, nullptr);
     glXDestroyContext(mDisplay, (GLXContext)mGLContext);
     mGLContext = nullptr;
@@ -1516,7 +2005,9 @@ void IGraphicsLinux::ProcessX11Events()
 
   const float scale = GetTotalScale();
 
-  while (XPending(mDisplay))
+  // mDisplay can be nulled underneath us by a close from another thread; the
+  // check has to be repeated every iteration.
+  while (mDisplay && XPending(mDisplay))
   {
     XEvent ev;
     XNextEvent(mDisplay, &ev);
@@ -1552,6 +2043,17 @@ void IGraphicsLinux::ProcessX11Events()
           }
         }
 
+        // A minimized/unmapped window reports 0x0. XResizeWindow(0,0) is a
+        // BadValue X error and IGraphics cannot lay out a zero-sized window, so
+        // ignore the notification entirely.
+        if (ce.width <= 0 || ce.height <= 0)
+          break;
+
+        // (No filter on mLastPhysW here: the window manager can resize the
+        // window without us asking, so a size we did not request is not
+        // necessarily stale. Superseded sizes within one batch are already
+        // handled by the drain-to-latest loop above.)
+
         // Update tracking to the actual X11 window size.
         mLastPhysW = (unsigned)ce.width;
         mLastPhysH = (unsigned)ce.height;
@@ -1581,7 +2083,11 @@ void IGraphicsLinux::ProcessX11Events()
           const int logH = Height();
           const float scaleX = static_cast<float>(physW) / (logW * ss);
           const float scaleY = static_cast<float>(physH) / (logH * ss);
-          const float newScale = std::max(scaleX, scaleY);
+          // min() fits the whole UI into the window (same semantic as
+          // IGEditorDelegate::OnParentWindowResize). max() would scale up and
+          // crop. PlatformResize is suppressed above, so the window keeps the
+          // size the host gave it and there is no feedback loop.
+          const float newScale = std::min(scaleX, scaleY);
           Resize(logW, logH, newScale, false);
         }
         else
@@ -1620,7 +2126,7 @@ void IGraphicsLinux::ProcessX11Events()
 
         const bool left   = (be.button == Button1);
         const bool right  = (be.button == Button3);
-        const bool middle = (be.button == Button2);
+        // IMouseMod has no middle-button field, so Button2 is not represented.
         IMouseMod mod(left, right, shift, ctrl, alt);
 
         mCursorX = x;
@@ -1722,7 +2228,28 @@ void IGraphicsLinux::ProcessX11Events()
       case ClientMessage:
       {
         if ((Atom)ev.xclient.data.l[0] == mWMDeleteMessage)
-          CloseWindow();
+        {
+          // Do NOT close here: we are on the timer thread, inside a member
+          // function of the very object CloseWindow() would destroy, and
+          // closing would null mDisplay out from under this loop. Flag it and
+          // let OnDisplayTimer()/the owning thread do the teardown.
+          mCloseRequested = true;
+          return;
+        }
+        break;
+      }
+
+      // Our window (or the host parent it was embedded in) is gone. Every
+      // further X/GL call on it would raise an X error, and glXSwapBuffers on a
+      // destroyed drawable is fatal — stop drawing and let the host's
+      // removed()/CloseWindow() path run.
+      case DestroyNotify:
+      {
+        if (ev.xdestroywindow.window == mPlugWnd)
+        {          mWindowAlive = false;
+          mPlugWnd = 0;
+          return;
+        }
         break;
       }
 
@@ -1779,8 +2306,15 @@ void* IGraphicsLinux::TimerThreadProc(void* pParam)
   while (pGraphics->mTimerRunning)
   {
     usleep(TIMER_INTERVAL_US);
-    if (pGraphics->mTimerRunning)
-      pGraphics->OnDisplayTimer();
+    if (!pGraphics->mTimerRunning)
+      break;
+    pGraphics->OnDisplayTimer();
+    // Yield briefly between ticks. A host thread that is closing the window
+    // blocks in IGEditorDelegate::CloseWindow() on the same GfxMutex we take in
+    // OnDisplayTimer(); without this gap a tight try_lock loop can starve it
+    // (std::recursive_mutex does not queue waiters fairly). ~1ms on a 16ms
+    // frame is imperceptible.
+    usleep(1000);
   }
   return nullptr;
 }
@@ -1789,18 +2323,39 @@ void IGraphicsLinux::StartTimer()
 {
   if (mHostDriven)
     return;  // host provides timer/fd callbacks; no internal thread needed
-  if (pthread_create(&mTimerThread, nullptr, TimerThreadProc, this) == 0)
-    mTimerRunning = true;
+
+  // Never leave a previous thread behind (e.g. a second OpenWindow).
+  StopTimer();
+
+  // The flag must be set BEFORE pthread_create: TimerThreadProc() loops on
+  // mTimerRunning, so if the new thread is scheduled first it would see false,
+  // exit immediately, and leave a "running" timer with no thread behind it —
+  // no X11 events and no redraws, ever.
+  mTimerRunning = true;
+  if (pthread_create(&mTimerThread, nullptr, TimerThreadProc, this) != 0)
+  {
+    mTimerRunning = false;
+    mTimerThread = 0;
+    DBGMSG("IGraphicsLinux: failed to create render thread\n");
+  }
 }
 
 void IGraphicsLinux::StopTimer()
 {
-  if (mTimerRunning)
-  {
-    mTimerRunning = false;
-    pthread_join(mTimerThread, nullptr);
-    mTimerThread = 0;
-  }
+  if (!mTimerRunning.load())
+    return;
+
+  mTimerRunning = false;
+
+  // Called from the timer thread itself (e.g. a control callback that closes
+  // the window): pthread_join would return EDEADLK. Leave the thread to unwind
+  // on its own — OnDisplayTimer() checks mTimerRunning/mCloseRequested and
+  // returns, and the flag is already false so no further tick runs.
+  if (mTimerThread == 0 || pthread_equal(pthread_self(), mTimerThread))
+    return;
+
+  pthread_join(mTimerThread, nullptr);
+  mTimerThread = 0;
 }
 
 void IGraphicsLinux::OnDisplayTimer()
@@ -1813,9 +2368,64 @@ void IGraphicsLinux::OnDisplayTimer()
   // concurrently modify IGraphics state while we process events or draw.
   // The mutex is recursive so ProcessX11Events() -> DrawResize() can
   // re-enter safely.
-  std::lock_guard<std::recursive_mutex> lock(GetDelegate()->GfxMutex());
+  //
+  // try_lock rather than lock: CloseWindow() is normally entered from a host
+  // thread that already holds GfxMutex (IGEditorDelegate::CloseWindow) and then
+  // joins this thread. If we blocked here on that mutex, the joiner would wait
+  // for a thread that waits for the mutex it holds — a permanent freeze that
+  // also wedges the host's UI. Giving up instead lets StopTimer()'s join
+  // complete.
+  std::unique_lock<std::recursive_mutex> lock(GetDelegate()->GfxMutex(), std::defer_lock);
+  for (int i = 0; i < 500 && !lock.try_lock(); ++i)
+  {
+    if (!mTimerRunning)
+      return;  // being stopped; the closer is waiting for us to leave
+    usleep(1000);
+  }
+
+  if (!lock.owns_lock())
+  {
+    DBGMSG("IGraphicsLinux: GfxMutex busy for 500ms, skipping frame\n");
+    return;
+  }
+
+  // Keep the GL context current for the whole tick, not just around Draw():
+  // ProcessX11Events() can deliver a ConfigureNotify, which calls Resize() ->
+  // DrawResize() -> nvgDeleteFramebuffer/nvgCreateFramebuffer. Those are GL
+  // calls; without a current context they either fault or silently produce an
+  // incomplete framebuffer (which is what previously surfaced as a null
+  // mMainFrameBuffer / blank GUI).
+  ActivateGLContext();
 
   ProcessX11Events();
+
+  // Deliver the results of any out-of-process file dialogs that have finished.
+  // Runs here (render thread, GfxMutex held) so the completion handlers touch
+  // the UI on the same thread that owns it, exactly like the synchronous path
+  // did.
+  DrainPendingDialogs();
+
+
+  // The WM asked us to close (mCloseRequested is set by ProcessX11Events).
+  // Only the owning thread may destroy the display, so stop here and let
+  // IGEditorDelegate::CloseWindow() (or the destructor) run on the host
+  // thread; the timer thread exits because mTimerRunning is false.
+  if (mCloseRequested)
+  {
+    DeactivateGLContext();
+    mTimerRunning = false;
+    return;
+  }
+
+  // The X server destroyed our window (host closed it, or the parent went
+  // away). Nothing is drawable any more — stop rather than issuing X/GL calls
+  // on a dead drawable.
+  if (!mWindowAlive)
+  {
+    DeactivateGLContext();
+    mTimerRunning = false;
+    return;
+  }
 
   IRECTList rects;
   if (mNeedsRedraw || IsDirty(rects))
@@ -1828,13 +2438,13 @@ void IGraphicsLinux::OnDisplayTimer()
       IRECT full(0, 0, (float)WindowWidth() / scale, (float)WindowHeight() / scale);
       rects.Add(full);
     }
-    ActivateGLContext();
     Draw(rects);
-#if defined(IGRAPHICS_GL2) || defined(IGRAPHICS_GL3)
+#ifdef IGRAPHICS_GL
     glXSwapBuffers(mDisplay, mPlugWnd);
 #endif
-    DeactivateGLContext();
   }
+
+  DeactivateGLContext();
 }
 
 #ifndef NO_IGRAPHICS

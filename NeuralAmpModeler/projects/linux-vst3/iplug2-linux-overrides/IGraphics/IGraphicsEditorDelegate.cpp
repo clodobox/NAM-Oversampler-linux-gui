@@ -71,11 +71,34 @@ void IGEditorDelegate::CloseWindow()
 void IGEditorDelegate::OnParentWindowResize(int width, int height)
 {
   IPLUG_GFX_LOCK;
-  if (auto* pGraphics = GetUI())
+  auto* pGraphics = GetUI();
+
+  if (pGraphics == nullptr)
+    return;
+
+  const auto platformScale = pGraphics->GetPlatformWindowScale();
+
+  if (pGraphics->GetResizerMode() == EUIResizerMode::Scale)
   {
-    const auto scale = pGraphics->GetPlatformWindowScale();
-    pGraphics->Resize(static_cast<int>(width / scale), static_cast<int>(height / scale), 1.0f, false);
+    // Scale mode: keep the UI laid out at its design size and fit it to the
+    // window the host handed us, which is the same thing a corner-resizer drag
+    // used to do. min() (not max()) so the whole UI stays visible instead of
+    // being cropped.
+    const float sx = (float) width  / (pGraphics->Width()  * platformScale);
+    const float sy = (float) height / (pGraphics->Height() * platformScale);
+    pGraphics->Resize(pGraphics->Width(), pGraphics->Height(), std::min(sx, sy), false);
   }
+  else
+  {
+    pGraphics->Resize(static_cast<int>(width / platformScale),
+                      static_cast<int>(height / platformScale), 1.0f, false);
+  }
+
+  // Keep the size the plug-in reports to the host (IPlugView::getSize) in sync
+  // with the window the host actually gave us; it is otherwise only updated on
+  // host-initiated sizes that carry needsPlatformResize, so a later getSize()
+  // would report a stale editor size and the host could snap the window back.
+  SetEditorSize(width, height);
 }
 
 void IGEditorDelegate::SetScreenScale(float scale)

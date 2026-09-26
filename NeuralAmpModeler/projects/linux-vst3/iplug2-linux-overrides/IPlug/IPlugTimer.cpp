@@ -153,10 +153,18 @@ Timer* Timer::Create(ITimerFunction func, uint32_t intervalMs)
 
 Timer_impl::Timer_impl(ITimerFunction func, uint32_t intervalMs)
 : mTimerFunc(func)
-, mIntervalMs(intervalMs)
+, mIntervalMs(intervalMs ? intervalMs : 1)  // 0 would spin the thread at 100% CPU
 {
-  if (pthread_create(&mThread, nullptr, ThreadProc, this) == 0)
-    mRunning = true;
+  // Set the flag BEFORE creating the thread: ThreadProc loops on mRunning, so
+  // if the new thread is scheduled before the parent stores true it sees false,
+  // exits immediately, and leaves a timer that claims to be running with no
+  // thread behind it — the plugin's parameter/MIDI/UI pump would then never run.
+  mRunning = true;
+  if (pthread_create(&mThread, nullptr, ThreadProc, this) != 0)
+  {
+    mRunning = false;
+    mThread = 0;
+  }
 }
 
 Timer_impl::~Timer_impl()
@@ -171,6 +179,12 @@ void Timer_impl::Stop()
   bool expected = true;
   if (mRunning.compare_exchange_strong(expected, false))
   {
+    // Never join ourselves: Stop() can be reached from inside the timer
+    // callback (a plugin closing its own editor), where pthread_join would
+    // just return EDEADLK. The thread unwinds on its own once it sees the flag.
+    if (mThread && pthread_equal(pthread_self(), mThread))
+      return;
+
     pthread_join(mThread, nullptr);
     mThread = 0;
   }

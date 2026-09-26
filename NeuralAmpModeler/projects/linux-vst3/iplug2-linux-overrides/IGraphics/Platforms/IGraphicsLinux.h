@@ -155,6 +155,23 @@ private:
   Atom mWMDeleteMessage = 0;
   std::atomic<bool> mTimerRunning{false};
 
+  // Set when the window manager asks us to close (WM_DELETE_WINDOW). The close
+  // itself must NOT happen inside ProcessX11Events() — that runs on the timer
+  // thread and would destroy mDisplay/the IGraphics object out from under the
+  // event pump (XPending(NULL) → SIGSEGV). OnDisplayTimer() acts on the flag
+  // after the pump has returned instead.
+  std::atomic<bool> mCloseRequested{false};
+
+  // Cleared when the X server tells us mPlugWnd is gone (DestroyNotify). After
+  // that, any further X/GL call on the drawable would raise an X error.
+  std::atomic<bool> mWindowAlive{true};
+
+  // glXMakeCurrent() is reference-counted here: IGraphicsNanoVG may activate the
+  // context recursively (e.g. LoadAPIBitmap inside a frame), and the outermost
+  // release is the only one that may unbind the context.
+  int mGLContextDepth = 0;
+
+
   float mHiddenCursorX = 0.f;
   float mHiddenCursorY = 0.f;
   Cursor mBlankCursor = 0;  // cached invisible cursor for HideMouseCursor
@@ -184,6 +201,51 @@ private:
   // XResizeWindow request) and must be ignored to prevent mWidth from reverting.
   unsigned mLastPhysW = 0;
   unsigned mLastPhysH = 0;
+
+  // ---- Out-of-process dialogs ----------------------------------------------
+  // An in-process GTK dialog runs a nested GTK main loop (gtk_dialog_run), and
+  // GTK only supports one main loop, on the thread that initialised it. When the
+  // host is itself GTK-based (REAPER's SWELL, Bitwig, ...), running our own
+  // gtk_main() from the render thread races the host's GTK state, wedges the
+  // GfxMutex that the dialog is holding, and freezes the host — the same failure
+  // that forced popup menus onto the self-drawn path. Where `zenity` exists we
+  // run the dialog in a child process instead and deliver the result back to the
+  // render thread.
+  struct DialogResult
+  {
+    enum class Kind
+    {
+      File,
+      Directory,
+      MessageBox
+    } kind = Kind::File;
+
+    WDL_String file;
+    WDL_String path;
+    EMsgBoxResult msgResult = EMsgBoxResult::kOK;
+    IFileDialogCompletionHandlerFunc fileHandler;
+    IMsgBoxCompletionHandlerFunc msgHandler;
+  };
+
+  // Shared with a detached helper thread. The helper only ever touches the
+  // slot, never this object, so a dialog still running when the window closes
+  // cannot become a use-after-free — CloseWindow() marks the slot abandoned and
+  // the helper's write is simply dropped.
+  struct DialogSlot
+  {
+    std::mutex mutex;
+    bool abandoned = false;
+    bool hasResult = false;
+    DialogResult result;
+  };
+
+  std::vector<std::shared_ptr<DialogSlot>> mDialogSlots;  // render thread only
+  void DrainPendingDialogs();
+  void StartOutOfProcessFileDialog(bool isDirectory, bool isSave,
+                                   const WDL_String& initialPath,
+                                   const WDL_String& initialFileName,
+                                   const char* ext,
+                                   IFileDialogCompletionHandlerFunc completionHandler);
 
   void StartTimer();
   void StopTimer();

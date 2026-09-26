@@ -58,12 +58,25 @@ public:
   {
     TRACE
 
+#if defined OS_LINUX
+    // The host owns the window size on Linux: follow whatever it gives us,
+    // whether or not the plug-in advertised host-driven resize (this build has
+    // PLUG_HOST_RESIZE 0 for the other platforms' benefit, where the plug-in
+    // owns its own window). Without this the editor never follows a DAW window
+    // resize.
+    if (pSize)
+    {
+      rect = *pSize;
+      mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
+    }
+#else
     if (pSize && mOwner.GetHostResizeEnabled())
     {
       rect = *pSize;
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
     }
-    
+#endif
+
     return Steinberg::kResultTrue;
   }
 
@@ -87,12 +100,22 @@ public:
 
   Steinberg::tresult PLUGIN_API canResize() override
   {
+#if defined OS_LINUX
+    // Advertise the editor as resizable so the host lets the user resize the
+    // plug-in window and tells us about it (see onSize above). There is no
+    // corner resizer on Linux, so this is the only way to resize the UI.
+    if (mOwner.HasUI())
+      return Steinberg::kResultTrue;
+
+    return Steinberg::kResultFalse;
+#else
     if (mOwner.HasUI() && mOwner.GetHostResizeEnabled())
     {
       return Steinberg::kResultTrue;
     }
 
     return Steinberg::kResultFalse;
+#endif
   }
 
   Steinberg::tresult PLUGIN_API checkSizeConstraint(Steinberg::ViewRect* pRect) override
@@ -100,7 +123,40 @@ public:
     int w = pRect->getWidth();
     int h = pRect->getHeight();
 
-    if(!mOwner.ConstrainEditorResize(w, h))
+    bool needsUpdate = !mOwner.ConstrainEditorResize(w, h);
+
+#if defined OS_LINUX
+    // Keep the plug-in's aspect ratio. The editor is scaled to fit whatever
+    // window it is given, so any other ratio would leave a band the UI does not
+    // cover (black, and visibly stale while dragging). Snapping the height to the
+    // width keeps the window exactly filled.
+    // Aspect ratio is captured once, from the editor's design size, and then
+    // held: deriving it from the current editor size every time would lock in a
+    // wrong ratio if the host ever resized us without asking first.
+    if (mAspectRatio <= 0.f)
+    {
+      const int ew = mOwner.GetEditorWidth();
+      const int eh = mOwner.GetEditorHeight();
+
+      if (ew > 0 && eh > 0)
+        mAspectRatio = static_cast<float>(ew) / static_cast<float>(eh);
+    }
+
+    if (mAspectRatio > 0.f)
+    {
+      // ConstrainEditorResize() above already clamped the width into the
+      // editor's min/max range, so the proportional height is in range too.
+      const int snappedH = static_cast<int>((static_cast<double>(w) / mAspectRatio) + 0.5);
+
+      if (snappedH != h)
+      {
+        h = snappedH;
+        needsUpdate = true;
+      }
+    }
+#endif
+
+    if (needsUpdate)
     {
       pRect->right = pRect->left + w;
       pRect->bottom = pRect->top + h;
@@ -113,6 +169,17 @@ public:
   {
     if (mOwner.HasUI())
     {
+      // Capture the design aspect ratio here, before the host has had a chance
+      // to resize us, so checkSizeConstraint() can never lock in a wrong one.
+      if (mAspectRatio <= 0.f)
+      {
+        const int ew = mOwner.GetEditorWidth();
+        const int eh = mOwner.GetEditorHeight();
+
+        if (ew > 0 && eh > 0)
+          mAspectRatio = static_cast<float>(ew) / static_cast<float>(eh);
+      }
+
 #ifdef OS_WIN
       if (strcmp(type, Steinberg::kPlatformTypeHWND) == 0)
         mOwner.OpenWindow(pParent);
@@ -124,10 +191,18 @@ public:
       else
         return Steinberg::kResultFalse;
 #elif defined OS_LINUX
-      if (strcmp(type, Steinberg::kPlatformTypeX11EmbedWindowID) == 0)
-        mOwner.OpenWindow(pParent);
-      else
+      if (strcmp(type, Steinberg::kPlatformTypeX11EmbedWindowID) != 0)
         return Steinberg::kResultFalse;
+
+      // OpenWindow() returns null when it could not open a display, create the
+      // GL context, create the X11 window or make the context current. Per the
+      // VST3 contract `attached` must report that, otherwise the host believes
+      // it has a live editor and keeps calling onSize/setContentScaleFactor
+      // into a window that does not exist.
+      if (mOwner.OpenWindow(pParent) == nullptr)
+        return Steinberg::kResultFalse;
+#else
+      return Steinberg::kResultFalse;
 #endif
       return Steinberg::kResultTrue;
     }
@@ -307,4 +382,6 @@ public:
   }
 
   T& mOwner;
+  /** Editor aspect ratio (width / height), captured on first use. */
+  float mAspectRatio = 0.f;
 };

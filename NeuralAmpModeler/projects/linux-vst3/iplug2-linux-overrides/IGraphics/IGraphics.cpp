@@ -317,7 +317,23 @@ IControl* IGraphics::AttachControl(IControl* pControl, int ctrlTag, const char* 
 
 void IGraphics::AttachCornerResizer(EUIResizerMode sizeMode, bool layoutOnResize, const IColor& color, const IColor& mouseOverColor, const IColor& dragColor, float size)
 {
+#if defined OS_LINUX
+  // Deliberately a no-op on Linux.
+  //
+  // In a host the plug-in window belongs to the host: we get no window of our
+  // own, and resizing the X11 child we are given directly does not change the
+  // host's layout. The corner resizer would push XResizeWindow, the server would
+  // answer with a ConfigureNotify of a different size, that would be turned into
+  // another Resize(), and the two would fight — which is what made the corner
+  // jump between oversized and tiny. Instead the editor follows the window the
+  // host gives it (see IPlugVST3_View::onSize and
+  // IGEditorDelegate::OnParentWindowResize), which is what a user resizing the
+  // plug-in window in their DAW expects.
+  (void) sizeMode; (void) layoutOnResize; (void) color;
+  (void) mouseOverColor; (void) dragColor; (void) size;
+#else
   AttachCornerResizer(new ICornerResizerControl(GetBounds(), size, color, mouseOverColor, dragColor), sizeMode, layoutOnResize);
+#endif
 }
 
 void IGraphics::AttachCornerResizer(ICornerResizerControl* pControl, EUIResizerMode sizeMode, bool layoutOnResize)
@@ -349,6 +365,11 @@ void IGraphics::AttachBubbleControl(IBubbleControl* pControl)
 {
   pControl->SetDelegate(*GetDelegate());
   mBubbleControls.Add(pControl);
+}
+
+bool IGraphics::IsPopupMenuExpanded() const
+{
+  return mPopupControl && mPopupControl->GetExpanded();
 }
 
 void IGraphics::AttachPopupMenuControl(const IText& text, const IRECT& bounds)
@@ -1015,7 +1036,20 @@ void IGraphics::OnMouseDown(const std::vector<IMouseInfo>& points)
       }
 #endif
 
-#ifndef IGRAPHICS_NO_CONTEXT_MENU
+// On VST3, a right-click on a parameter is normally handed to the host so that
+// it can show its own context menu (IComponentHandler3::createContextMenu +
+// IContextMenu::popup). On Linux that means the host runs its own modal menu
+// loop re-entrantly on whatever thread we are on — the render/timer thread,
+// with GfxMutex held, while the host's own event loop runs on another thread.
+// That is the same "second toolkit main loop from the wrong thread" hazard that
+// forced the popup menus onto the self-drawn path, and hosts are free not to
+// implement IComponentHandler3 at all.
+//
+// So on Linux we skip it and let the control handle the right-click itself:
+// IControl::OnMouseDown -> PromptUserInput draws the self-drawn menu, and the
+// plug-in's own controls override OnMouseDown to open their own menus (e.g. the
+// MIDI CC menus on knobs).
+#if !defined IGRAPHICS_NO_CONTEXT_MENU && !defined OS_LINUX
       if (mod.R && paramIdx > kNoParameter)
       {
         ReleaseMouseCapture();
@@ -1431,6 +1465,9 @@ void IGraphics::PopupHostContextMenuForParam(IControl* pControl, int paramIdx, f
     }
 
 #else
+    // Not a host-native context menu (and never on Linux, see the #if above):
+    // draw it ourselves with IPopupMenuControl, the same way every other menu
+    // in the plug-in is shown.
     if(!contextMenu.NItems())
       return;
 
