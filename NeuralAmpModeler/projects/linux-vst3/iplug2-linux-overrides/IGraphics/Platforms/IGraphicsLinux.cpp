@@ -443,6 +443,21 @@ IGraphicsLinux::IGraphicsLinux(IGEditorDelegate& dlg, int w, int h, int fps, flo
 {
   // Required before any Xlib calls from multiple threads
   XInitThreads();
+
+  // Popup menus (CreatePlatformPopupMenu below) are built with GTK3 and run
+  // GTK's own nested main loop (g->main()/g->main_quit()) to wait for the
+  // user's choice. That call happens on our internal render/timer thread
+  // (mouse clicks are dispatched from ProcessX11Events(), called from
+  // OnDisplayTimer() there) while GfxMutex is held. A host whose own UI is
+  // also GTK-based (e.g. REAPER's SWELL) already runs GTK's main loop on ITS
+  // own thread; a second, concurrent gtk_main() from a different thread is
+  // not something GTK supports, and hangs — which then wedges GfxMutex
+  // forever and freezes the whole host on the very next call into the
+  // plugin. Force IGraphics' built-in self-drawn popup menu (same one used
+  // whenever CreatePlatformPopupMenu isn't available) instead, which reuses
+  // our existing NanoVG rendering and X11 event pump rather than a second,
+  // independent toolkit's own loop.
+  AttachPopupMenuControl();
 }
 
 IGraphicsLinux::~IGraphicsLinux()
