@@ -57,6 +57,13 @@ jobs:
         ./makedist-mac.sh full zip
       shell: bash
 
+    - name: Install Linux GUI build dependencies
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libfontconfig1-dev pkg-config
+      shell: bash
+
     - name: Build Linux VST3
       if: matrix.os == 'ubuntu-latest'
       run: |

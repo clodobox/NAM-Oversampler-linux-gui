@@ -26,3 +26,9 @@ mkcert*
 NeuralAmpModeler/peaks/
 
 .vs/
+
+# Local dev helper that contains an API key - never commit
+claude-deepseek.sh
+
+# Local build output (not committed)
+build/
