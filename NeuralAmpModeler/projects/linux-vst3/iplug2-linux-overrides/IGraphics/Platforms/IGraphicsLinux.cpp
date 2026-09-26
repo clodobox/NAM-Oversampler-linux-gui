@@ -1193,6 +1193,17 @@ void IGraphicsLinux::StartOutOfProcessFileDialog(bool isDirectory, bool isSave,
 
   std::vector<std::string> args;
   args.push_back("--file-selection");
+
+  // Attach the dialog to our window and make it modal to it. Without a parent
+  // the window manager is free to place the dialog anywhere and, more to the
+  // point, not give it keyboard focus - so typing a path into it silently did
+  // nothing.
+  if (mPlugWnd)
+  {
+    args.push_back("--modal");
+    args.push_back("--attach=" + std::to_string((unsigned long) mPlugWnd));
+  }
+
   if (isDirectory)
     args.push_back("--directory");
   else if (isSave)
