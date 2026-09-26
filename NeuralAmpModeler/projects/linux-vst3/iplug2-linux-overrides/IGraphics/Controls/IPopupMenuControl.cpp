@@ -250,19 +250,22 @@ void IPopupMenuControl::OnMouseOut()
 
 void IPopupMenuControl::OnMouseWheel(float x, float y, const IMouseMod& mod, float d)
 {
-  //FIXME:
-//  if(mActiveMenuPanel)
-//  {
-//    if(mActiveMenuPanel->mScroller)
-//    {
-//      if(d > 0.)
-//        mActiveMenuPanel->ScrollUp();
-//      else
-//        mActiveMenuPanel->ScrollDown();
-//    }
-//
-//    SetDirty(false);
-//  }
+  // Upstream leaves this empty (a //FIXME:), so a menu that is taller than the
+  // window — a folder with more files than fit, the 33-entry CC submenus, ...
+  // could only be scrolled with the small arrow cells at its ends. Scroll it
+  // with the wheel instead when the panel is a scroller.
+  if (mActiveMenuPanel == nullptr || !mActiveMenuPanel->mScroller)
+    return;
+
+  if (d > 0.f)
+    mActiveMenuPanel->ScrollUp();
+  else
+    mActiveMenuPanel->ScrollDown();
+
+  // Redraw only: scrolling changes which items the (fixed) cells map to, so the
+  // highlight has to be re-tested, but no animation is involved.
+  mMouseCellBounds = mActiveMenuPanel->HitTestCells(x, y);
+  SetDirty(false);
 }
 
 void IPopupMenuControl::DrawCalloutArrow(IGraphics& g, const IRECT& bounds, IBlend* pBlend)
